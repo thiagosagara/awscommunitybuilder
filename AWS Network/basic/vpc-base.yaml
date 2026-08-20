@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VPC base reutilizavel entre series de conteudo (BGP na AWS, Network for Cloud Engineers).
+  Exports sao parametrizados por ProjectPrefix para permitir multiplos stacks no mesmo
+  account/region sem colisao de nomes.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: network-fundamentals
+    Description: >
+      Prefixo usado em tags e export names. Use um prefixo diferente por serie/artigo
+      se for rodar mais de um lab desta base no mesmo account (ex: bgp-series vs network-fundamentals).
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-vpc'
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-public-subnet'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectPrefix}-vpc-id'
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub '${ProjectPrefix}-vpc-cidr'
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${ProjectPrefix}-public-subnet-id'
+  PublicRouteTableId:
+    Value: !Ref PublicRouteTable
+    Export:
+      Name: !Sub '${ProjectPrefix}-public-rt-id'
