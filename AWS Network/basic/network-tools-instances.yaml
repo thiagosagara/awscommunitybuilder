@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Instancias de ferramentas de rede (tcpdump, ping, telnet, iptraf-ng) para os
+  experimentos praticos da serie Network for Cloud Engineers. Depende do stack
+  vpc-base.yaml ja implantado com o mesmo ProjectPrefix. Duas instancias na
+  subnet publica, uma na subnet privada. A subnet privada nao tem rota de
+  internet de proposito (ver artigo 1), entao o acesso a pacotes e ao SSM
+  acontece via VPC Endpoints, nao via NAT Gateway.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: network-fundamentals
+    Description: Deve ser o mesmo ProjectPrefix usado no stack vpc-base.yaml.
+
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    Description: t4g e familia Graviton (ARM64). A AMI resolvida abaixo ja e arm64.
+
+  LatestArm64AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 arm64 mais recente, resolvido via SSM Parameter Store.
+
+Resources:
+
+  # --- Security Group compartilhado pelas 3 instancias ---
+  # Libera trafego entre elas dentro da VPC, para os experimentos de tcpdump/ping/telnet.
+  ToolsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG das instancias de ferramentas de rede, trafego liberado dentro da VPC
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-vpc-id'
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: !ImportValue
+            Fn::Sub: '${ProjectPrefix}-vpc-cidr'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-tools-sg'
+
+  # --- SG dos VPC Endpoints, HTTPS vindo de dentro da VPC ---
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG dos VPC Interface Endpoints (SSM), HTTPS a partir da VPC
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-vpc-id'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !ImportValue
+            Fn::Sub: '${ProjectPrefix}-vpc-cidr'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-endpoints-sg'
+
+  # --- IAM Role para SSM, sem SSH exposto em nenhuma das 3 instancias ---
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # --- VPC Endpoints: por que a instancia privada consegue instalar pacote e falar com o SSM ---
+  # S3 Gateway Endpoint: os repositorios do AL2023 (core e SPAL) ficam hospedados em S3.
+  # Gateway endpoint e gratuito e se associa direto nas route tables, sem custo de hora rodada.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-vpc-id'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectPrefix}-public-rt-id'
+        - !ImportValue
+          Fn::Sub: '${ProjectPrefix}-private-rt-id'
+
+  # Interface Endpoints do SSM: substituem a rota de internet que o agente SSM
+  # normalmente usaria. Cobram por hora rodando (aprox. USD 0.01/h cada, x3, mais
+  # processamento de dados), mas evitam subir um NAT Gateway so pra isso.
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-vpc-id'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectPrefix}-private-subnet-id'
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-vpc-id'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectPrefix}-private-subnet-id'
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-vpc-id'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectPrefix}-private-subnet-id'
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  # --- Instancia publica 1 ---
+  PublicInstanceA:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestArm64AmiId
+      SubnetId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-public-subnet-id'
+      SecurityGroupIds:
+        - !Ref ToolsSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-tools-public-a'
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled amazonlinux-spal || true
+          dnf install -y tcpdump iputils telnet iptraf-ng
+
+  # --- Instancia publica 2 ---
+  PublicInstanceB:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestArm64AmiId
+      SubnetId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-public-subnet-id'
+      SecurityGroupIds:
+        - !Ref ToolsSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-tools-public-b'
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled amazonlinux-spal || true
+          dnf install -y tcpdump iputils telnet iptraf-ng
+
+  # --- Instancia privada ---
+  # Depende dos VPC Endpoints existirem primeiro, senao o UserData roda sem
+  # conseguir baixar pacote nenhum (a instancia sobe, mas o dnf install falha
+  # silenciosamente em background).
+  PrivateInstanceA:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - S3GatewayEndpoint
+      - SsmEndpoint
+      - SsmMessagesEndpoint
+      - Ec2MessagesEndpoint
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestArm64AmiId
+      SubnetId: !ImportValue
+        Fn::Sub: '${ProjectPrefix}-private-subnet-id'
+      SecurityGroupIds:
+        - !Ref ToolsSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-tools-private-a'
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled amazonlinux-spal || true
+          dnf install -y tcpdump iputils telnet iptraf-ng
+
+Outputs:
+  PublicInstanceAId:
+    Value: !Ref PublicInstanceA
+  PublicInstanceBId:
+    Value: !Ref PublicInstanceB
+  PrivateInstanceAId:
+    Value: !Ref PrivateInstanceA
