@@ -20,6 +20,10 @@ Parameters:
     Type: String
     Default: 10.0.1.0/24
 
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.100.0/24
+
 Resources:
   VPC:
     Type: AWS::EC2::VPC
@@ -41,6 +45,16 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${ProjectPrefix}-public-subnet'
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-private-subnet'
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -77,6 +91,22 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-private-rt'
+  # Nenhuma rota adicionada aqui de proposito. So a table e a associacao,
+  # do jeito que foi pedido. Sem rota 0.0.0.0/0, sem NAT.
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
 Outputs:
   VpcId:
     Value: !Ref VPC
@@ -94,3 +124,11 @@ Outputs:
     Value: !Ref PublicRouteTable
     Export:
       Name: !Sub '${ProjectPrefix}-public-rt-id'
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${ProjectPrefix}-private-subnet-id'
+  PrivateRouteTableId:
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub '${ProjectPrefix}-private-rt-id'
