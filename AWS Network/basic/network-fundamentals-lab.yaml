@@ -115,6 +115,13 @@ Resources:
       Egress: false
       CidrBlock: !ImportValue
         Fn::Sub: '${ProjectPrefix}-vpc-cidr'
+      Icmp:
+        Type: -1
+        Code: -1
+      # Type -1 e Code -1 significam "todos os tipos e codigos ICMP".
+      # A API do EC2 exige esse bloco explicito sempre que Protocol = 1 (ICMPv4),
+      # mesmo que voce queira liberar tudo. Omitir ele quebra o create com
+      # "must contain the parameter icmpTypeCode.type".
   # Sem regra de outbound para portas efemeras aqui de proposito.
   # O leitor adiciona (RuleNumber 110, protocolo 6, portas 1024-65535)
   # como parte do exercicio, e ve a diferenca na hora.
