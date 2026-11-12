@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  VPC IPAM BGP route protection for BYOIP prefixes. Creates an Advanced Tier
+  IPAM, a public BYOIP pool, the Internet Registry Association used for
+  delegated RPKI, and a CloudWatch alarm for ROA expiration. The RIR
+  delegation, the association enable, the CIDR provisioning and the routing
+  policy registrations are done with the AWS CLI (see README.md).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "IPAM" }
+        Parameters: [OperatingRegion]
+      - Label: { default: "Regional Internet Registry" }
+        Parameters: [Rir, OrgHandle]
+      - Label: { default: "ROA expiration alarm" }
+        Parameters: [CreateRoaAlarm, RoaCidr, RoaAsn, RoaMaxLength, DaysBeforeExpiration, AlertEmail]
+
+Parameters:
+  OperatingRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region where the IPAM manages CIDRs. Also used as the pool locale.
+
+  Rir:
+    Type: String
+    Default: LACNIC
+    AllowedValues: [RIPE, APNIC, ARIN, LACNIC]
+    Description: >
+      Regional Internet Registry that holds your block. The CloudFormation
+      schema does not accept NICBR (the CLI does). See README, known issues.
+
+  OrgHandle:
+    Type: String
+    Description: Your organization handle at the RIR (on Registro.br, usually the technical ID).
+
+  CreateRoaAlarm:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >
+      Create the ROA expiration alarm. Set to true after the CIDR is
+      provisioned and you know the ASN and max-length of its ROA.
+
+  RoaCidr:
+    Type: String
+    Default: 203.0.113.0/24
+    Description: BYOIP CIDR covered by the ROA (Cidr and RoaPrefix dimensions).
+
+  RoaAsn:
+    Type: String
+    Default: "64512"
+    Description: ASN authorized in the ROA.
+
+  RoaMaxLength:
+    Type: String
+    Default: "24"
+    Description: Max-length of the ROA (equal to the prefix length for a Strict ROA).
+
+  DaysBeforeExpiration:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Alarm when the ROA is this many days from expiring.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email subscribed to the alarm topic. Leave empty to skip the subscription.
+
+Conditions:
+  WithRoaAlarm: !Equals [!Ref CreateRoaAlarm, "true"]
+  WithEmail: !And
+    - !Condition WithRoaAlarm
+    - !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  Ipam:
+    Type: AWS::EC2::IPAM
+    Properties:
+      Description: IPAM with BGP route protection
+      Tier: advanced                     # findings and delegated RPKI are Advanced only
+      OperatingRegions:
+        - RegionName: !Ref OperatingRegion
+
+  ByoipPool:
+    Type: AWS::EC2::IPAMPool
+    Properties:
+      Description: BYOIP IPv4 pool
+      IpamScopeId: !GetAtt Ipam.PublicDefaultScopeId
+      AddressFamily: ipv4
+      Locale: !Ref OperatingRegion       # must be an operating region of the IPAM
+      AwsService: ec2
+      PublicIpSource: byoip
+      Tags:
+        - Key: Name
+          Value: byoip-pool
+
+  RirAssociation:
+    Type: AWS::EC2::IpamInternetRegistryAssociation
+    # Deleting the association removes every ROA AWS manages under it,
+    # so the stack keeps it on delete. Remove it on purpose (README, cleanup).
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Delegated RPKI for BYOIP
+      IpamId: !GetAtt Ipam.IpamId
+      Rir: !Ref Rir
+      OrganizationHandle: !Ref OrgHandle
+
+  RoaAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: WithRoaAlarm
+    Properties:
+      TopicName: ipam-roa-expiration
+
+  RoaAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: WithEmail
+    Properties:
+      TopicArn: !Ref RoaAlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  RoaExpirationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithRoaAlarm
+    Properties:
+      AlarmName: !Sub "IPAM-RoaExpiration-${RoaAsn}-${RoaMaxLength}"
+      AlarmDescription: !Sub "ROA for ${RoaCidr} is ${DaysBeforeExpiration} days or less from expiring"
+      Namespace: AWS/IPAM
+      MetricName: RoaExpiration          # days until the ROA expires
+      Dimensions:                        # all four are needed to target one ROA
+        - Name: Cidr
+          Value: !Ref RoaCidr
+        - Name: RoaPrefix
+          Value: !Ref RoaCidr
+        - Name: Asn
+          Value: !Ref RoaAsn
+        - Name: MaxLength
+          Value: !Ref RoaMaxLength
+      Statistic: Minimum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref DaysBeforeExpiration
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref RoaAlarmTopic
+
+Outputs:
+  IpamId:
+    Value: !GetAtt Ipam.IpamId
+  PublicScopeId:
+    Value: !GetAtt Ipam.PublicDefaultScopeId
+  PoolId:
+    Value: !GetAtt ByoipPool.IpamPoolId
+  AssociationId:
+    Value: !GetAtt RirAssociation.IpamInternetRegistryAssociationId
+  AssociationState:
+    Description: Should read pending-enable before you go to the RIR portal.
+    Value: !GetAtt RirAssociation.State
